@@ -1,7 +1,10 @@
 # ZOMVYRA for Mac.
 # Whenever a release is published, this takes the Windows installer of that release (ZOMVYRA-Setup.exe), lifts the game out of it,
-# wraps it as a Mac app for both kinds of Mac (Apple Silicon and Intel in one), and attaches ZOMVYRA-mac.dmg to the same release.
+# wraps it as a Mac app and attaches two files to the same release:
+#   ZOMVYRA-mac.zip        for Macs with Apple Silicon (M1 and later)
+#   ZOMVYRA-mac-intel.zip  for older Macs with an Intel processor
 # Nothing else has to be uploaded for the Mac: publish the Windows release as always and wait a few minutes.
+# It runs on one of GitHub's Linux machines (their Mac machines were not to be had), so the Mac app is put together and signed there.
 # By hand: Actions -> "Mac build" -> Run workflow (tag empty = the newest release).
 name: Mac build
 
@@ -25,7 +28,7 @@ concurrency:
 jobs:
   mac:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -57,7 +60,7 @@ jobs:
       - name: Lift the game out of it
         run: |
           SZ="$(command -v 7zz || command -v 7z || true)"
-          if [ -z "$SZ" ]; then brew install sevenzip; SZ="$(command -v 7zz)"; fi
+          if [ -z "$SZ" ]; then sudo apt-get install -y -q p7zip-full; SZ="$(command -v 7z)"; fi
           "$SZ" x -y -bso0 -bsp0 dl/ZOMVYRA-Setup.exe -oinst
           PKG="$(find inst -name 'app-64.7z' | head -1)"; [ -z "$PKG" ] && PKG="$(find inst -name 'app-*.7z' | head -1)"
           [ -n "$PKG" ] || { echo "::error::no app package inside the installer"; find inst -maxdepth 3 | head -50; exit 1; }
@@ -77,62 +80,36 @@ jobs:
         run: |
           # the Windows icon, enlarged into the sizes a Mac wants; without it the app still builds, with a plain icon
           set +e
-          sips -s format png src/icon.ico --out base.png >/dev/null 2>&1
-          if [ -s base.png ]; then
-            mkdir icon.iconset
-            for s in 16 32 128 256 512; do
-              sips -z $s $s base.png --out "icon.iconset/icon_${s}x${s}.png" >/dev/null
-              d=$((s*2)); sips -z $d $d base.png --out "icon.iconset/icon_${s}x${s}@2x.png" >/dev/null
-            done
-            iconutil -c icns icon.iconset -o icon.icns
-          fi
-          [ -s icon.icns ] && echo "icon ok" || echo "::warning::no Mac icon could be made from icon.ico"
+          python3 -m pip install --quiet --disable-pip-version-check pillow
+          python3 -c "from PIL import Image; im = Image.open('src/icon.ico').convert('RGBA').resize((1024, 1024), Image.LANCZOS); im.save('icon.icns')"
+          [ -s icon.icns ] && ls -l icon.icns || echo "::warning::no Mac icon could be made from icon.ico"
           exit 0
+
+      - name: Signing tool
+        run: |
+          # no Apple account: the app signs itself ("ad hoc"). Without any signature a Mac with Apple Silicon refuses to start it at all.
+          URL="$(gh api repos/indygreg/apple-platform-rs/releases --paginate -q '.[].assets[].browser_download_url' | grep -E 'apple-codesign-[0-9.]+-x86_64-unknown-linux-musl\.tar\.gz$' | head -1 || true)"
+          echo "signing tool: $URL"
+          RC=""
+          if [ -n "$URL" ]; then mkdir rc; curl -sL "$URL" | tar xz -C rc; RC="$(find "$PWD/rc" -name rcodesign -type f | head -1)"; fi
+          if [ -z "$RC" ]; then cargo install apple-codesign --locked; RC="$(command -v rcodesign)"; fi
+          "$RC" --version
+          echo "RC=$RC" >> "$GITHUB_ENV"
 
       - name: Wrap it as a Mac app
         run: |
           ICON=""; [ -s icon.icns ] && ICON="--icon=icon.icns"
-          pack(){ npx --yes @electron/packager@18 src ZOMVYRA --platform=darwin --arch="$1" --electron-version="$ELECTRON" --out=out --overwrite --no-prune \
-            --app-bundle-id=com.ender.zomvyra --app-version="$VER" --build-version="$VER" --app-category-type=public.app-category.action-games $ICON; }
-          if ! pack universal; then echo "::warning::the build for both kinds of Mac failed; building for Apple Silicon only"; rm -rf out; pack arm64; fi
-          APP="$(find out -maxdepth 2 -name 'ZOMVYRA.app' | head -1)"; test -d "$APP"
-          echo "APP=$APP" >> "$GITHUB_ENV"
-          # no Apple account: the app signs itself. Without any signature a Mac with Apple Silicon refuses to start it at all.
-          xattr -cr "$APP"
-          codesign --force --deep --sign - "$APP"
-          codesign --verify --deep --strict "$APP"
-          lipo -archs "$APP/Contents/MacOS/ZOMVYRA" || true
-          du -sh "$APP"
-
-      - name: Start it once
-        run: |
-          # does it come up and stay up? (a look only: a failed look is reported, it does not stop the build)
-          set +e
-          "$APP/Contents/MacOS/ZOMVYRA" --user-data-dir="$RUNNER_TEMP/zv-data" > run.log 2>&1 &
-          PID=$!; sleep 30
-          screencapture -x shot.png 2>/dev/null
-          if kill -0 $PID 2>/dev/null; then echo "the game is running"; kill $PID; else echo "::warning::the game did not stay open on the build machine"; fi
-          tail -40 run.log
-          exit 0
-
-      - name: Disk image
-        run: |
-          mkdir dmg; ditto "$APP" dmg/ZOMVYRA.app; ln -s /Applications dmg/Applications
-          for i in 1 2 3 4; do
-            hdiutil create -volname "ZOMVYRA" -srcfolder dmg -ov -format UDZO -fs HFS+ ZOMVYRA-mac.dmg && break
-            sleep 15
+          for A in arm64 x64; do
+            npx --yes @electron/packager@18 src ZOMVYRA --platform=darwin --arch="$A" --electron-version="$ELECTRON" --out=out --overwrite --no-prune \
+              --app-bundle-id=com.ender.zomvyra --app-version="$VER" --build-version="$VER" --app-category-type=public.app-category.action-games $ICON
+            APP="out/ZOMVYRA-darwin-$A/ZOMVYRA.app"
+            test -x "$APP/Contents/MacOS/ZOMVYRA" && test -f "$APP/Contents/Resources/app/main.js"
+            "$RC" sign "$APP" 2>&1 | tail -15
+            "$RC" print-signature-info "$APP/Contents/MacOS/ZOMVYRA" 2>&1 | head -30 || true
+            NAME="ZOMVYRA-mac.zip"; [ "$A" = x64 ] && NAME="ZOMVYRA-mac-intel.zip"
+            (cd "out/ZOMVYRA-darwin-$A" && zip -qry "$GITHUB_WORKSPACE/$NAME" ZOMVYRA.app)
+            du -sh "$APP"; ls -l "$NAME"
           done
-          test -s ZOMVYRA-mac.dmg; ls -l ZOMVYRA-mac.dmg
 
-      - name: Attach it to the release
-        run: gh release upload "$TAG" ZOMVYRA-mac.dmg --repo "$REPO" --clobber
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: first-start
-          path: |
-            shot.png
-            run.log
-          if-no-files-found: ignore
-          retention-days: 14
+      - name: Attach them to the release
+        run: gh release upload "$TAG" ZOMVYRA-mac.zip ZOMVYRA-mac-intel.zip --repo "$REPO" --clobber
